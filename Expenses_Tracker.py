@@ -62,21 +62,31 @@ with tab2:
                         # Filter strictly for 'Money Out' transaction lines
                         if "Money Out (£)" in line_clean and "Column" not in line_clean:
 
-                            # 1. Flexible Date Parser
+                            # 1. Robust Date Parser
                             date_match = re.search(
-                                r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{2})", line_clean)
-                            tx_date = date_match.group(
-                                1) if date_match else "Unknown Date"
+                                r"D(\d)ate\s*(\d)?\s*([A-Za-z]{3}\s+\d{2})", line_clean)
+                            if date_match:
+                                tens, units, month_yr = date_match.groups()
+                                tx_date = f"{tens}{units or ''} {month_yr}"
+                            else:
+                                tx_date = "Unknown Date"
 
-                            # 2. Description Cleaner (removes OCR artifacts and extracts merchant)
+                            # 2. Universal Description Cleaner & Prefix Rescuer
+                            desc_prefix_match = re.search(
+                                r"D([A-Za-z])escription", line_clean)
+                            prefix_letter = desc_prefix_match.group(
+                                1) if desc_prefix_match else ""
+
                             clean_desc = re.sub(
-                                r"D\d?ate.*?(?:escription)?", "", line_clean)
+                                r"^.*?escription\s*", "", line_clean)
                             clean_desc = re.sub(
-                                r"T(?:D|P)ype.*", "", clean_desc)
+                                r"T(?:D|P|F)ype.*", "", clean_desc)
+                            clean_desc = re.sub(r"Moneyb.*", "", clean_desc)
                             clean_desc = re.sub(
                                 r"[0-9,]+\.\d{2}Money Out.*", "", clean_desc).strip()
-                            clean_desc = re.sub(
-                                r"^[A-Za-z]\s*", "", clean_desc)
+
+                            if prefix_letter and not clean_desc.upper().startswith(prefix_letter.upper()):
+                                clean_desc = prefix_letter + clean_desc
 
                             # 3. Amount Parser
                             amt_match = re.search(
