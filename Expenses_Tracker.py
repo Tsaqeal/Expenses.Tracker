@@ -1,90 +1,121 @@
-from datetime import date
-import pandas as pd
-from supabase import create_client
 import streamlit as st
+import pandas as pd
+import pdfplumber
+import re
+from supabase import create_client, Client
 
-st.set_page_config(
-    page_title="SQL Expenses Tracker", page_icon="📊", layout="wide"
-)
+# --- Supabase Configuration ---
+SUPABASE_URL = st.secrets["supabase"]["url"]
+SUPABASE_KEY = st.secrets["supabase"]["key"]
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 1. CONNECT TO SUPABASE ---
-@st.cache_resource
-def init_connection():
-  url = st.secrets["supabase"]["url"]
-  key = st.secrets["supabase"]["key"]
-  return create_client(url, key)
+st.set_page_config(page_title="Expenses Tracker", page_icon="💰", layout="wide")
 
+st.title("💰 Personal Expenses Tracker")
 
-supabase = init_connection()
+# --- Navigation Tabs ---
+tab1, tab2 = st.tabs(["➕ Add Single Expense", "📥 Bulk Import Lloyds PDF"])
 
-# --- 2. PASSWORD PROTECTION ---
-if "authenticated" not in st.session_state:
-  st.session_state.authenticated = False
+# --- TAB 1: Single Expense Entry ---
+with tab1:
+    st.header("Add a Single Expense")
+    with st.form("single_expense_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            date = st.date_input("Date")
+            reason = st.text_input("Reason / Merchant")
+        with col2:
+            amount = st.number_input(
+                "Amount (£)", min_value=0.0, format="%.2f")
 
-if not st.session_state.authenticated:
-  st.title("🔒 Login Required")
-  password = st.text_input("Enter Password", type="password")
-  if st.button("Unlock", use_container_width=True):
-    if password == st.secrets.get("app_password", "YourSecretPasswordHere"):
-      st.session_state.authenticated = True
-      st.rerun()
-    else:
-      st.error("Incorrect password")
-  st.stop()
+        submitted = st.form_submit_button("Save Expense")
+        if submitted:
+            try:
+                supabase.table("expenses").insert({
+                    "date": str(date),
+                    "reason": reason,
+                    "amount": amount
+                }).execute()
+                st.success("Expense saved successfully to Supabase!")
+            except Exception as e:
+                st.error(f"Error saving expense: {e}")
 
-# --- 3. MAIN DASHBOARD UI ---
-st.title("📊 SQL Expenses & Financials Dashboard")
+# --- TAB 2: Bulk PDF Statement Import ---
+with tab2:
+    st.header("Bulk Import Lloyds Bank Statement (PDF)")
+    st.markdown(
+        "Upload your monthly Lloyds statement PDF to automatically filter and import all **Money Out** expenses.")
 
-# Input Form in Sidebar
-with st.sidebar:
-  st.subheader("➕ Add New Expense")
-  with st.form("expense_form", clear_on_submit=True):
-    expense_date = st.date_input("Date", value=date.today())
-    amount = st.number_input("Amount (£)", min_value=0.01, format="%.2f")
-    reason = st.text_input("Reason", placeholder="e.g., Groceries, Coffee")
+    uploaded_pdf = st.file_uploader(
+        "Upload Monthly Statement PDF", type=["pdf"])
 
-    submitted = st.form_submit_button("Save to Database", use_container_width=True)
+    if uploaded_pdf is not None:
+        extracted_expenses = []
 
-  if submitted:
-    if not reason.strip():
-      st.error("Please enter a reason.")
-    else:
-      try:
-        supabase.table("expenses").insert({
-            "date": str(expense_date),
-            "amount": float(amount),
-            "reason": reason.strip(),
-        }).execute()
-        st.success("Saved successfully!")
-        st.rerun()
-      except Exception as e:
-        st.error(f"Error saving data: {e}")
+        with pdfplumber.open(uploaded_pdf) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    for line in text.split("\n"):
+                        line_clean = line.strip()
 
-# --- 4. FETCH AND DISPLAY DATA FROM SQL ---
-response = (
-    supabase.table("expenses").select("*").order("date", desc=True).execute()
-)
-data = response.data
+                        # Filter strictly for 'Money Out' transaction lines
+                        if "Money Out (£)" in line_clean and "Column" not in line_clean:
 
-if data:
-  df = pd.DataFrame(data)
+                            # 1. Flexible Date Parser
+                            date_match = re.search(
+                                r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{2})", line_clean)
+                            tx_date = date_match.group(
+                                1) if date_match else "Unknown Date"
 
-  total_spent = df["amount"].sum()
-  total_transactions = len(df)
+                            # 2. Description Cleaner (removes OCR artifacts and extracts merchant)
+                            clean_desc = re.sub(
+                                r"D\d?ate.*?(?:escription)?", "", line_clean)
+                            clean_desc = re.sub(
+                                r"T(?:D|P)ype.*", "", clean_desc)
+                            clean_desc = re.sub(
+                                r"[0-9,]+\.\d{2}Money Out.*", "", clean_desc).strip()
+                            clean_desc = re.sub(
+                                r"^[A-Za-z]\s*", "", clean_desc)
 
-  col1, col2 = st.columns(2)
-  col1.metric(label="Total Spent", value=f"£{total_spent:,.2f}")
-  col2.metric(label="Total Transactions", value=total_transactions)
+                            # 3. Amount Parser
+                            amt_match = re.search(
+                                r"([0-9,]+\.\d{2})Money Out \(£\)", line_clean)
+                            if amt_match:
+                                try:
+                                    tx_amount = float(
+                                        amt_match.group(1).replace(",", ""))
+                                    extracted_expenses.append({
+                                        "date": tx_date,
+                                        "reason": clean_desc,
+                                        "amount": tx_amount
+                                    })
+                                except ValueError:
+                                    pass
 
-  st.divider()
+        if extracted_expenses:
+            df_expenses = pd.DataFrame(extracted_expenses)
+            st.success(
+                f"Successfully extracted {len(df_expenses)} outgoing expenses!")
 
-  st.subheader("Spending Over Time")
-  df["date"] = pd.to_datetime(df["date"])
-  chart_df = df.groupby("date")["amount"].sum().reset_index()
-  st.line_chart(chart_df, x="date", y="amount", use_container_width=True)
+            st.markdown("### Review & Edit Extracted Expenses Before Saving:")
+            edited_df = st.data_editor(
+                df_expenses, num_rows="dynamic", use_container_width=True)
 
-  st.divider()
-  st.subheader("All Records")
-  st.dataframe(df, use_container_width=True)
-else:
-  st.info("No expenses recorded in the database yet. Add one using the sidebar!")
+            if st.button("🚀 Save All to Supabase Database"):
+                success_count = 0
+                for _, row in edited_df.iterrows():
+                    try:
+                        supabase.table("expenses").insert({
+                            "date": str(row["date"]),
+                            "reason": str(row["reason"]),
+                            "amount": float(row["amount"])
+                        }).execute()
+                        success_count += 1
+                    except Exception as e:
+                        st.error(f"Error saving row: {e}")
+
+                st.success(
+                    f"Successfully saved {success_count} expenses to Supabase!")
+        else:
+            st.warning("No outgoing transactions found in this PDF.")
